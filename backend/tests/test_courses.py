@@ -1,3 +1,7 @@
+import re
+import threading
+import time
+
 from .conftest import create_course, register_and_login
 
 
@@ -44,6 +48,125 @@ def test_knowledge_summary_without_materials(client, auth_headers):
     body = resp.json()
     assert body["agent_mode"] == "fallback"
     assert body["summary"]
+
+    streamed = client.post(
+        f"/api/courses/{course_id}/knowledge-summary/stream", headers=auth_headers
+    )
+    assert streamed.status_code == 200
+    assert "event: meta" in streamed.text
+    assert "event: done" in streamed.text
+
+
+def test_knowledge_summary_covers_all_chunks_in_natural_chapter_order(
+    client, auth_headers
+):
+    """不能只取前 30 个切片；即使后上传第一章，也应排在第十章前。"""
+    course_id = create_course(client, auth_headers)
+    chapter10 = "\n".join(
+        f"第十章 知识点 {index}：" + "后续章节内容" * 70 for index in range(36)
+    )
+    uploads = (
+        ("Chap10.txt", chapter10),
+        ("Chap1.txt", "第一章 基础概念。" + "基础内容" * 180),
+    )
+    for filename, content in uploads:
+        resp = client.post(
+            f"/api/courses/{course_id}/materials",
+            files={"file": (filename, content.encode(), "text/plain")},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 201, resp.text
+
+    resp = client.post(
+        f"/api/courses/{course_id}/knowledge-summary", headers=auth_headers
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["sources"]) > 30
+    assert body["summary"].index("《Chap1.txt》") < body["summary"].index("《Chap10.txt》")
+    assert body["sources"][0]["material_name"] == "Chap1.txt"
+    assert body["sources"][-1]["material_name"] == "Chap10.txt"
+
+
+def test_knowledge_summary_batches_every_chunk_with_stable_global_citations(monkeypatch):
+    from app.services import agent
+    from app.services.retrieval import RetrievedChunk
+
+    chunks = [
+        RetrievedChunk(1, 1, "Chap1.txt", "第一章-A", 0),
+        RetrievedChunk(2, 1, "Chap1.txt", "第一章-B", 0),
+        RetrievedChunk(3, 1, "Chap1.txt", "第一章-C", 0),
+        RetrievedChunk(4, 2, "Chap2.txt", "第二章-D", 0),
+    ]
+    calls = []
+
+    def fake_complete(system, user_content, **kwargs):
+        del system, kwargs
+        calls.append(user_content)
+        return f"## 小节{len(calls)}\n- 已整理"
+
+    monkeypatch.setattr(agent, "complete", fake_complete)
+    monkeypatch.setattr(agent, "_SUMMARY_BATCH_CHARS", 12)
+    monkeypatch.setattr(agent, "_SUMMARY_BATCH_CHUNKS", 2)
+    monkeypatch.setattr(agent, "_SUMMARY_MAX_WORKERS", 1)
+
+    result = agent.summarize_knowledge("测试课程", chunks)
+    combined_context = "\n".join(calls)
+    assert result["agent_mode"] == "llm"
+    assert len(calls) == 3
+    assert all(chunk.content in combined_context for chunk in chunks)
+    assert [source["index"] for source in result["sources"]] == [1, 2, 3, 4]
+    assert [int(value) for value in re.findall(r"\[(\d+)\] 来源", combined_context)] == [
+        1,
+        2,
+        3,
+        4,
+    ]
+    assert (
+        result["summary"].index("小节1")
+        < result["summary"].index("小节2")
+        < result["summary"].index("小节3")
+    )
+
+
+def test_knowledge_summary_batches_run_concurrently_and_report_progress(monkeypatch):
+    from app.services import agent
+    from app.services.retrieval import RetrievedChunk
+
+    chunks = [
+        RetrievedChunk(index, index, f"Chap{index}.txt", f"第{index}章", 0)
+        for index in range(1, 4)
+    ]
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_complete(system, user_content, **kwargs):
+        nonlocal active, max_active
+        del system, kwargs
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        chapter = re.search(r"第(\d+)章", user_content).group(1)
+        return f"### 第{chapter}章\n- 已整理"
+
+    monkeypatch.setattr(agent, "complete", fake_complete)
+    monkeypatch.setattr(agent, "_SUMMARY_MAX_WORKERS", 3)
+
+    events = list(agent.summarize_knowledge_events("测试课程", chunks))
+    assert max_active == 3
+    assert events[0] == (
+        "meta",
+        {"total": 3, "materials": 3, "fragments": 3},
+    )
+    progress = [data for event, data in events if event == "progress"]
+    assert [item["completed"] for item in progress] == [1, 2, 3]
+    done = next(data for event, data in events if event == "done")
+    assert done["summary"].index("《Chap1.txt》") < done["summary"].index("《Chap2.txt》")
+    assert done["summary"].index("《Chap2.txt》") < done["summary"].index("《Chap3.txt》")
 
 
 def test_delete_course_cleans_files_and_detaches_user_data(client, auth_headers):

@@ -4,7 +4,7 @@
 
 系统采用前后端分离架构。前端使用 Vue 3、Vue Router、Pinia 和 Element Plus 构建课程管理、资料管理、Agent 对话、学习计划、待办任务和个人中心等页面；后端使用 FastAPI、SQLAlchemy 2.0 和 Pydantic v2 提供 RESTful API，以 SQLite 保存业务数据，并以本地文件系统保存上传资料。系统支持 TXT、Markdown、PDF、DOCX、PPTX 等文件的文本抽取和滑动窗口切片；配置 Embedding 服务时使用余弦相似度进行语义检索，未配置或调用失败时自动降级为关键词检索。Agent 同时兼容 Anthropic 和 OpenAI 两类协议，并通过服务器发送事件实现文本增量和工具调用过程的实时展示。
 
-在原始需求基础上，系统完成了资料来源引用、知识点整理、智能任务拆解和多课程学习规划四项高级功能，并增加离线降级、到期提醒、日历视图、跨用户数据隔离、Markdown 安全消毒等工程能力。当前版本提供 33 个 API 操作、8 张业务数据表和 10 个 Agent 工具。自动化验证包括 42 项后端测试和 2 项前端安全渲染测试，生产构建成功，前端依赖审计结果为 0 个已知漏洞。结果表明，该平台能够形成“资料入库—内容检索—Agent 推理—计划执行—任务反馈”的学习闭环。
+在原始需求基础上，系统完成了资料来源引用、知识点整理、智能任务拆解和多课程学习规划四项高级功能，并增加离线降级、到期提醒、日历视图、跨用户数据隔离、Markdown 安全消毒等工程能力。当前版本提供 34 个 API 操作、8 张业务数据表和 10 个 Agent 工具。自动化验证包括 45 项后端测试和 2 项前端安全渲染测试，生产构建成功，前端依赖审计结果为 0 个已知漏洞。结果表明，该平台能够形成“资料入库—内容检索—Agent 推理—计划执行—任务反馈”的学习闭环。
 
 **关键词：** 课程学习助手；智能体；检索增强生成；工具调用；学习计划；FastAPI；Vue 3
 
@@ -86,7 +86,7 @@
 | 高级功能 | 需求说明 | 本项目实现方式 |
 | --- | --- | --- |
 | 资料来源引用 | 回答标明参考资料或片段 | 检索结果分配稳定编号，消息保存引用 JSON |
-| 知识点整理 | 自动提取重点并生成提纲 | 采样课程切片，生成带编号引用的 Markdown |
+| 知识点整理 | 自动提取重点并生成提纲 | 读取全部切片，按章节自然排序并分批生成带编号引用的 Markdown |
 | 智能任务拆解 | 将目标拆为阶段和每日任务 | 结构化 JSON 计划落库，并批量创建 Task |
 | 多课程学习规划 | 综合截止时间与任务量 | 向模型提供课程 ID、目标和期限，任务按课程绑定 |
 
@@ -118,10 +118,10 @@
 | R-04 | 学习计划 | plans 路由、PlansView | 单课程、多课程计划测试 |
 | R-05 | 个人中心 | auth、ProfileView | 认证、统计接口组合验证 |
 | R-06 | 用户认证 | security、auth 路由 | 注册、登录、越权测试 |
-| R-07 | RESTful API | 六组路由 | OpenAPI 共 33 个操作 |
+| R-07 | RESTful API | 六组路由 | OpenAPI 共 34 个操作 |
 | R-08 | 资料检索 | extraction、retrieval | 关键词与向量排序测试 |
 | R-09 | 来源引用 | Agent 工具执行器 | 检索与全文读取引用测试 |
-| R-10 | 知识点整理 | summarize_knowledge | 无资料降级测试 |
+| R-10 | 知识点整理 | ordered_course_chunks、summarize_knowledge_events | 全切片覆盖、章节自然排序、并行分批、SSE 进度与无资料降级测试 |
 | R-11 | 智能任务拆解 | generate_plan、Task | 计划自动生成任务测试 |
 | R-12 | 多课程规划 | generate_multi_plan | 多课程任务归属测试 |
 
@@ -274,7 +274,7 @@ User 1 ─── N Course 1 ─── N Material 1 ─── N MaterialChunk
 | 分类 | 主要路径 | 操作数 | 说明 |
 | --- | --- | --- | --- |
 | 认证 | `/api/auth/*` | 4 | 注册、登录、查询和修改本人 |
-| 课程 | `/api/courses*` | 6 | CRUD 与知识点整理 |
+| 课程 | `/api/courses*` | 7 | CRUD、知识点整理与流式进度 |
 | 资料 | `/api/courses/{id}/materials*` | 5 | 上传、筛选、检索、下载、删除 |
 | 对话 | `/api/conversations*` | 7 | 会话、消息、流式 Agent |
 | 计划 | `/api/plans*` | 5 | 单课程、多课程、查看、删除 |
@@ -357,6 +357,12 @@ def search_chunks(db, course_id, query, limit=6):
     return _keyword_search(rows, query, limit)
 ```
 
+### 6.3.1 知识点完整总结与章节排序
+
+知识点整理不再固定采样前 30 个切片，而是读取课程内全部可解析切片。系统优先从资料文件名识别 `Chap2`、`Chapter 2`、`第2章` 或 `第二章` 等章节号；文件名没有章节号时，再检查首个正文切片。资料之间按章节号和自然文件名排序，使 Chap2 位于 Chap10 之前；同一资料内部严格按照 `seq` 保持原文顺序。
+
+为避免一次请求超过模型上下文，排序后的内容按资料分组，并以最多 50 个切片或约 30000 字符为一批总结。后端使用受限线程池同时处理最多 3 批，完成后仍按照预先记录的位置组装结果，因此并发不会改变章节顺序。每个批次都使用全局连续的来源编号，并提示模型覆盖本批出现的每个章节和小节。专用 SSE 接口先返回资料数、片段数和总批次数，随后持续发送已完成批次；前端显示进度条和耗时，不再长时间停留在无反馈的加载状态。离线模式同样按章节顺序列出全部片段目录。
+
 ## 6.4 大模型统一访问层
 
 LLM 服务通过 `LLM_PROVIDER` 在 Anthropic 和 OpenAI 兼容协议之间切换。模型名、密钥和 Base URL 均由环境变量提供，因此可以连接官方服务，也可以连接 DeepSeek、通义千问、Kimi 或统一中转服务。统一层向上提供文本补全、流式补全、JSON 补全和流式工具 Agent 四种能力。
@@ -402,7 +408,7 @@ for round in 1..8:
 
 ## 6.7 引用机制
 
-每次检索命中包含 chunk_id、material_id、资料名、正文和分数。工具执行器维护 `chunk_index` 字典，在多轮检索中对相同切片去重，并将引用写入 `citations_out`。模型看到的工具结果包含 `[编号]`，system prompt 要求在相关句末标注该编号。最终引用快照保存到 messages.citations_json，前端在回答下方显示资料标签，悬停可查看摘录。
+每次检索命中包含 chunk_id、material_id、资料名、正文和分数。工具执行器维护 `chunk_index` 字典，在多轮检索中对相同切片去重，并将引用写入 `citations_out`。模型看到的工具结果包含 `[编号]`，system prompt 要求在相关句末标注该编号。最终引用快照保存到 messages.citations_json，前端在回答下方显示资料标签，悬停可查看摘录。点击来源标签后，前端携带 material_id 和引用编号跳转到课程资料页，显示来源提示并高亮目标资料行，便于用户下载原文或继续检索。
 
 引用机制的目的不是证明模型每个字都来自资料，而是让用户能够核查回答依据。若资料不足，提示词要求模型明确说明，再给出一般性解释。离线模式不生成综合答案，而是直接展示检索片段，避免把本地规则包装成大模型结论。
 
@@ -420,7 +426,7 @@ for round in 1..8:
 
 前端使用 Hash 路由，避免静态部署时服务器缺少回退配置。路由守卫根据 localStorage 中的 token 限制课程、计划、任务和个人中心页面。Pinia Auth Store 保存 token 和用户信息，页面刷新后通过 `/auth/me` 恢复登录态。
 
-Axios 实例统一设置 `/api` 基地址、120 秒超时和 Authorization 请求头。响应拦截器处理普通接口错误和登录失效；流式对话因 Axios 不便处理浏览器增量流，使用 fetch 和 ReadableStream 手工解析 SSE 帧。
+Axios 实例统一设置 `/api` 基地址、120 秒超时和 Authorization 请求头。响应拦截器处理普通接口错误和登录失效；流式对话与知识点整理进度因 Axios 不便处理浏览器增量流，使用 fetch 和 ReadableStream 手工解析 SSE 帧。
 
 <!-- pagebreak -->
 
@@ -450,7 +456,7 @@ Axios 实例统一设置 `/api` 基地址、120 秒超时和 Authorization 请�
 │   │   ├── schemas/      # 请求、响应与校验规则
 │   │   ├── routers/      # auth/courses/materials/chat/plans/tasks
 │   │   └── services/     # agent/llm/retrieval/extraction/security
-│   ├── tests/            # 42 项后端测试
+│   ├── tests/            # 45 项后端测试
 │   └── environment.yml   # class-study Conda 环境
 ├── frontend/
 │   ├── src/api/          # Axios 与 SSE 客户端
@@ -480,11 +486,11 @@ Axios 实例统一设置 `/api` 基地址、120 秒超时和 Authorization 请�
 
 ### 7.5.1 课程与资料页面
 
-课程首页以响应式卡片显示课程基本信息，并在卡片上提供问答、编辑和删除入口。课程详情使用标签页组织资料管理和知识点整理。上传区域组合 el-upload、资料类型下拉框和说明输入框；资料表格提供类型标签、大小格式化、下载与删除；正文检索区域展示资料名、匹配度和摘录。
+课程首页以响应式卡片显示课程基本信息，并在卡片上提供问答、编辑和删除入口。课程详情使用标签页组织资料管理和知识点整理。上传区域支持拖拽或点击批量选择，提供空文件、重复文件和 50MB 大小校验，并保留失败文件供重试；资料表格提供类型标签、大小格式化、下载与删除；正文检索区域展示资料名、匹配度和摘录。
 
 ### 7.5.2 Agent 对话页面
 
-页面左侧为对话列表，右侧为消息区。发送后立即插入临时用户消息和助手消息，使交互具有即时反馈。meta 事件到达后替换真实消息 ID；delta 事件追加文本；tool 事件转换为“检索课程资料”“创建任务”等中文说明；done 事件写入引用和 Agent 模式。回答通过安全 Markdown 渲染，引用以可悬停标签显示。
+页面左侧为对话列表，右侧为消息区。发送后立即插入临时用户消息和助手消息，使交互具有即时反馈。meta 事件到达后替换真实消息 ID；delta 事件追加文本；tool 事件转换为“检索课程资料”“创建任务”等中文说明；done 事件写入引用和 Agent 模式。回答通过安全 Markdown 渲染，引用以可悬停标签显示；标签同时是可键盘操作的跳转入口，可定位并高亮对应资料。
 
 ### 7.5.3 计划和任务页面
 
@@ -544,7 +550,7 @@ OpenAI 模拟客户端第一轮返回 lookup 工具调用，系统执行后把 r
 
 | 验证项 | 结果 |
 | --- | --- |
-| 后端 pytest | 42 passed |
+| 后端 pytest | 45 passed |
 | 前端 Vitest | 2 passed |
 | Python compileall | 通过 |
 | Vite production build | 通过，1684 modules transformed |
@@ -643,9 +649,9 @@ SSE 响应在生成期间可能被浏览器关闭。如果等模型完成后才�
 | --- | --- |
 | 源程序 | 前后端完整代码、测试和配置模板 |
 | 数据设计 | 8 张业务表及轻量迁移逻辑 |
-| 接口 | 33 个 OpenAPI 操作、Swagger 文档 |
+| 接口 | 34 个 OpenAPI 操作、Swagger 文档 |
 | Agent | 10 个业务工具、双协议循环、SSE |
-| 测试 | 后端 42 项、前端 2 项 |
+| 测试 | 后端 45 项、前端 2 项 |
 | 文档 | README、课程原始要求、设计实践报告 |
 
 ## 10.4 需求验收结论
@@ -771,6 +777,7 @@ Agent 工具只能在当前登录用户的数据范围内执行，后端仍会�
 | GET/POST | /api/courses | 课程列表、新建课程 |
 | GET/PUT/DELETE | /api/courses/{course_id} | 课程详情、修改、删除 |
 | POST | /api/courses/{course_id}/knowledge-summary | 知识点整理 |
+| POST | /api/courses/{course_id}/knowledge-summary/stream | 知识点整理 SSE 进度 |
 | POST/GET | /api/courses/{course_id}/materials | 上传、列出资料 |
 | GET | /api/courses/{course_id}/materials/search | 正文检索 |
 | GET/DELETE | /api/materials/{material_id} | 下载、删除资料 |

@@ -19,3 +19,9 @@ dist/
 .vscode/
 .idea/
 .DS_Store
+
+# Office / presentation build caches
+~$*
+*.lock
+课程学习助手Agent平台新版汇报/preview/
+课程学习助手Agent平台新版汇报/contact_sheet_*.png

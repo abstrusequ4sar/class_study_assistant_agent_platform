@@ -137,6 +137,17 @@ function scrollToBottom() {
   })
 }
 
+function jumpToCitation(citation) {
+  if (!citation?.material_id) return
+  router.push({
+    path: `/courses/${courseId}`,
+    query: {
+      material_id: String(citation.material_id),
+      citation: String(citation.index),
+    },
+  })
+}
+
 onMounted(async () => {
   const { data } = await getCourse(courseId)
   course.value = data
@@ -198,11 +209,19 @@ onMounted(async () => {
                 <el-tooltip
                   v-for="c in msg.citations"
                   :key="c.index"
-                  :content="c.excerpt"
+                  :content="`${c.excerpt}（点击跳转到来源资料）`"
                   placement="top"
                 >
-                  <el-tag size="small" class="citation-tag">
+                  <el-tag
+                    size="small"
+                    class="citation-tag"
+                    role="link"
+                    tabindex="0"
+                    @click="jumpToCitation(c)"
+                    @keyup.enter="jumpToCitation(c)"
+                  >
                     [{{ c.index }}] {{ c.material_name }}
+                    <el-icon class="citation-link-icon"><ArrowRight /></el-icon>
                   </el-tag>
                 </el-tooltip>
               </div>
@@ -347,7 +366,17 @@ onMounted(async () => {
 }
 .citation-tag {
   margin: 2px 4px 2px 0;
-  cursor: default;
+  cursor: pointer;
+  user-select: none;
+}
+.citation-tag:hover,
+.citation-tag:focus {
+  filter: brightness(0.96);
+  outline: 2px solid rgba(64, 158, 255, 0.2);
+}
+.citation-link-icon {
+  margin-left: 3px;
+  vertical-align: -2px;
 }
 .md :deep(p) {
   margin: 4px 0;

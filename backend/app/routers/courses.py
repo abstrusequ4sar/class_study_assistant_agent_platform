@@ -1,8 +1,10 @@
 """课程管理 CRUD 与知识点整理。"""
+import json
 import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -20,7 +22,7 @@ from ..models import (
 from ..schemas.chat import KnowledgeSummaryOut
 from ..schemas.course import CourseCreate, CourseOut, CourseUpdate
 from ..services import agent
-from ..services.retrieval import sample_chunks
+from ..services.retrieval import ordered_course_chunks
 from ..services.security import get_current_user
 
 router = APIRouter(prefix="/api/courses", tags=["courses"])
@@ -128,11 +130,34 @@ def knowledge_summary(
     course: Course = Depends(get_owned_course), db: Session = Depends(get_db)
 ):
     """根据课程资料自动提取重点知识点，生成复习提纲（高级功能）。"""
-    chunks = sample_chunks(db, course.id, limit=30)
+    chunks = ordered_course_chunks(db, course.id)
     result = agent.summarize_knowledge(course.name, chunks)
     return KnowledgeSummaryOut(
         course_id=course.id,
         summary=result["summary"],
         agent_mode=result["agent_mode"],
         sources=result["sources"],
+    )
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@router.post("/{course_id}/knowledge-summary/stream")
+def knowledge_summary_stream(
+    course: Course = Depends(get_owned_course), db: Session = Depends(get_db)
+):
+    """流式整理全部资料：立即返回批次数，并持续报告并行处理进度。"""
+    chunks = ordered_course_chunks(db, course.id)
+    course_name = course.name
+
+    def event_stream():
+        for event, data in agent.summarize_knowledge_events(course_name, chunks):
+            yield _sse(event, data)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

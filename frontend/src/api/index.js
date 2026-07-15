@@ -12,7 +12,58 @@ export const createCourse = (data) => client.post('/courses', data)
 export const getCourse = (id) => client.get(`/courses/${id}`)
 export const updateCourse = (id, data) => client.put(`/courses/${id}`, data)
 export const deleteCourse = (id) => client.delete(`/courses/${id}`)
-export const knowledgeSummary = (id) => client.post(`/courses/${id}/knowledge-summary`)
+export const knowledgeSummary = (id) =>
+  client.post(`/courses/${id}/knowledge-summary`, null, { timeout: 600000 })
+
+export async function knowledgeSummaryStream(id, { onMeta, onProgress, onDone } = {}) {
+  const token = localStorage.getItem('token')
+  const resp = await fetch(`/api/courses/${id}/knowledge-summary/stream`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  })
+  if (!resp.ok) {
+    let detail = '知识点整理失败，请稍后重试'
+    try {
+      const body = await resp.json()
+      if (typeof body.detail === 'string') detail = body.detail
+    } catch {
+      /* 非 JSON 错误体，使用默认提示 */
+    }
+    throw new Error(detail)
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let finished = false
+  const handleFrame = (frame) => {
+    let event = 'message'
+    let data = ''
+    for (const line of frame.split('\n')) {
+      if (line.startsWith('event: ')) event = line.slice(7).trim()
+      else if (line.startsWith('data: ')) data += line.slice(6)
+    }
+    if (!data) return
+    const payload = JSON.parse(data)
+    if (event === 'meta') onMeta?.(payload)
+    else if (event === 'progress') onProgress?.(payload)
+    else if (event === 'done') {
+      finished = true
+      onDone?.(payload)
+    }
+  }
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let separator
+    while ((separator = buffer.indexOf('\n\n')) !== -1) {
+      handleFrame(buffer.slice(0, separator))
+      buffer = buffer.slice(separator + 2)
+    }
+  }
+  if (!finished) throw new Error('知识点整理连接提前中断，请重试')
+}
 
 // ---- 资料 ----
 export const listMaterials = (courseId, params = {}) =>

@@ -7,7 +7,10 @@
 """
 import json
 import logging
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+from itertools import groupby
 from typing import Any
 
 from sqlalchemy import select
@@ -659,31 +662,178 @@ def fallback_answer(question: str, chunks: list[RetrievedChunk]) -> str:
 
 # ---------------------------------------------------------------- 知识点整理
 
-def summarize_knowledge(course_name: str, chunks: list[RetrievedChunk]) -> dict:
+_SUMMARY_BATCH_CHARS = 30_000
+_SUMMARY_BATCH_CHUNKS = 50
+_SUMMARY_MAX_WORKERS = 3
+
+
+def _summary_batches(indexed_chunks: list[tuple[int, RetrievedChunk]]):
+    """在不改变原文顺序的前提下拆分模型上下文。"""
+    batch: list[tuple[int, RetrievedChunk]] = []
+    char_count = 0
+    for item in indexed_chunks:
+        item_size = len(item[1].content)
+        if batch and (
+            len(batch) >= _SUMMARY_BATCH_CHUNKS
+            or char_count + item_size > _SUMMARY_BATCH_CHARS
+        ):
+            yield batch
+            batch = []
+            char_count = 0
+        batch.append(item)
+        char_count += item_size
+    if batch:
+        yield batch
+
+
+def _indexed_context_block(indexed_chunks: list[tuple[int, RetrievedChunk]]) -> str:
+    return "\n\n".join(
+        f"[{index}] 来源《{chunk.material_name}》:\n{chunk.content}"
+        for index, chunk in indexed_chunks
+    )
+
+
+def _normalize_partial_summary(text: str) -> str:
+    """分批结果统一从三级标题开始，方便按资料顺序组合。"""
+    return re.sub(r"^#{1,2}\s+", "### ", text.strip(), flags=re.MULTILINE)
+
+
+def _summary_jobs(chunks: list[RetrievedChunk]) -> list[dict]:
+    indexed = list(enumerate(chunks, start=1))
+    jobs = []
+    for _, grouped in groupby(indexed, key=lambda item: item[1].material_id):
+        material_chunks = list(grouped)
+        material_name = material_chunks[0][1].material_name
+        batches = list(_summary_batches(material_chunks))
+        for batch_index, batch in enumerate(batches, start=1):
+            jobs.append(
+                {
+                    "position": len(jobs),
+                    "material_name": material_name,
+                    "batch_index": batch_index,
+                    "batch_count": len(batches),
+                    "chunks": batch,
+                }
+            )
+    return jobs
+
+
+def _summary_system(course_name: str) -> str:
+    return (
+        f"你是《{course_name}》课程的学习助手。你正在按原始章节顺序分批整理课程资料。"
+        "必须覆盖当前批次中出现的每一个章节和小节，不得只挑选部分重点，也不得改变顺序。"
+        "生成 Markdown 复习提纲：章节和小节使用三级或更低级标题，知识点使用条目，"
+        "重要概念加粗，并在相关知识点后保留 [编号] 来源。"
+        "不要输出课程总标题、资料文件名或批次标题，也不要总结当前批次之外的内容。"
+    )
+
+
+def _run_summary_job(system: str, job: dict) -> str:
+    user_content = (
+        f"资料《{job['material_name']}》，内容范围 "
+        f"{job['batch_index']}/{job['batch_count']}。"
+        "下列片段已按原文顺序排列，请完整整理本范围内出现的所有章节和小节：\n\n"
+        f"{_indexed_context_block(job['chunks'])}"
+    )
+    partial = complete(system, user_content, max_tokens=4096)
+    return _normalize_partial_summary(partial)
+
+
+def _assemble_summary(course_name: str, jobs: list[dict], results: list[str]) -> str:
+    sections = [f"# 《{course_name}》完整复习提纲"]
+    previous_material = None
+    for job, partial in zip(jobs, results, strict=True):
+        if job["material_name"] != previous_material:
+            sections.extend(["", f"## 《{job['material_name']}》"])
+            previous_material = job["material_name"]
+        if job["batch_count"] > 1:
+            sections.extend(
+                ["", f"### 内容范围 {job['batch_index']}/{job['batch_count']}"]
+            )
+        sections.extend(["", partial])
+    return "\n".join(sections)
+
+
+def _offline_ordered_outline(
+    course_name: str, chunks: list[RetrievedChunk]
+) -> str:
+    lines = [
+        f"# 《{course_name}》资料章节目录",
+        "",
+        "【离线模式】未配置大模型 API，以下按章节与原文顺序列出全部可解析资料片段：",
+    ]
+    indexed = list(enumerate(chunks, start=1))
+    for _, grouped in groupby(indexed, key=lambda item: item[1].material_id):
+        material_chunks = list(grouped)
+        lines.extend(["", f"## 《{material_chunks[0][1].material_name}》", ""])
+        lines.extend(
+            f"- [{index}] {chunk.content[:120]}{'…' if len(chunk.content) > 120 else ''}"
+            for index, chunk in material_chunks
+        )
+    return "\n".join(lines)
+
+
+def summarize_knowledge_events(course_name: str, chunks: list[RetrievedChunk]):
+    """并行整理资料，依次产生 meta、progress、done 事件。"""
     sources = citations_for(chunks)
     if not chunks:
-        return {
+        yield "meta", {"total": 0, "materials": 0, "fragments": 0}
+        yield "done", {
             "summary": "本课程还没有可用于整理的资料，请先上传课件、笔记等文本资料。",
             "sources": [],
             "agent_mode": "fallback",
         }
+        return
+
+    jobs = _summary_jobs(chunks)
+    material_count = len({chunk.material_id for chunk in chunks})
+    yield "meta", {
+        "total": len(jobs),
+        "materials": material_count,
+        "fragments": len(chunks),
+    }
+
+    executor = ThreadPoolExecutor(max_workers=min(_SUMMARY_MAX_WORKERS, len(jobs)))
     try:
-        system = (
-            f"你是《{course_name}》课程的学习助手。请根据资料片段提取重点知识点，"
-            "生成一份 Markdown 格式的复习提纲：按主题分节，每个知识点一句话概括，"
-            "重要概念加粗，并在相关知识点后用 [编号] 标注来源资料。"
-        )
-        summary = complete(system, f"课程资料片段：\n{_context_block(chunks)}")
-        return {"summary": summary, "sources": sources, "agent_mode": "llm"}
+        system = _summary_system(course_name)
+        futures = {
+            executor.submit(_run_summary_job, system, job): job for job in jobs
+        }
+        results = [""] * len(jobs)
+        completed = 0
+        for future in as_completed(futures):
+            job = futures[future]
+            results[job["position"]] = future.result()
+            completed += 1
+            yield "progress", {
+                "completed": completed,
+                "total": len(jobs),
+                "material_name": job["material_name"],
+            }
+        yield "done", {
+            "summary": _assemble_summary(course_name, jobs, results),
+            "sources": sources,
+            "agent_mode": "llm",
+        }
     except LLMUnavailableError:
-        preview = "\n".join(
-            f"- 《{c.material_name}》片段{c.chunk_id}: {c.content[:80]}…" for c in chunks[:10]
-        )
-        return {
-            "summary": "【离线模式】未配置大模型 API，暂以资料片段目录代替知识点提纲：\n" + preview,
+        yield "done", {
+            "summary": _offline_ordered_outline(course_name, chunks),
             "sources": sources,
             "agent_mode": "fallback",
         }
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def summarize_knowledge(course_name: str, chunks: list[RetrievedChunk]) -> dict:
+    """普通 JSON 接口兼容入口；内部同样使用并行分批实现。"""
+    result = None
+    for event, data in summarize_knowledge_events(course_name, chunks):
+        if event == "done":
+            result = data
+    if result is None:  # 防御性兜底，正常生成器必定产生 done
+        raise RuntimeError("知识点整理未产生结果")
+    return result
 
 
 # ---------------------------------------------------------------- 学习计划

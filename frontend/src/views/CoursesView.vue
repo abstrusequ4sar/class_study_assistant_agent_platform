@@ -1,20 +1,55 @@
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { createCourse, deleteCourse, listCourses, updateCourse } from '../api'
+import {
+  createCourse,
+  deleteCourse,
+  listCoursePriorities,
+  listCourses,
+  updateCourse,
+} from '../api'
 
 const router = useRouter()
 const courses = ref([])
+const priorities = ref([])
 const dialogVisible = ref(false)
 const editingId = ref(null)
 const form = reactive({ name: '', description: '', teacher: '', semester: '' })
 
 async function refresh() {
-  const { data } = await listCourses()
-  courses.value = data
+  const [{ data: courseData }, { data: priorityData }] = await Promise.all([
+    listCourses(),
+    listCoursePriorities(),
+  ])
+  courses.value = courseData
+  priorities.value = priorityData
 }
 onMounted(refresh)
+
+const priorityMap = computed(() =>
+  Object.fromEntries(priorities.value.map((item) => [item.course_id, item])),
+)
+const sortedCourses = computed(() =>
+  [...courses.value].sort(
+    (left, right) =>
+      (priorityMap.value[left.id]?.rank || 999) - (priorityMap.value[right.id]?.rank || 999),
+  ),
+)
+
+function priorityOf(courseId) {
+  return priorityMap.value[courseId]
+}
+
+function priorityTagType(level) {
+  return { high: 'danger', medium: 'warning', low: 'success' }[level] || 'info'
+}
+
+function progressStatus(value) {
+  if (value >= 80) return 'success'
+  if (value < 50) return 'exception'
+  return ''
+}
 
 function openCreate() {
   editingId.value = null
@@ -70,17 +105,52 @@ async function remove(course) {
       </el-button>
     </div>
 
+    <el-alert
+      v-if="courses.length"
+      class="priority-tip"
+      type="info"
+      :closable="false"
+      show-icon
+      title="课程已按动态优先级排序"
+      description="系统综合任务截止时间、未完成任务量、学习计划期限、任务完成率和最近阶段测验成绩实时计算；完成任务或提交测验后会自动更新。"
+    />
+
     <el-empty v-if="!courses.length" description="还没有课程，点击右上角创建第一门课程吧" />
 
     <el-row :gutter="16">
-      <el-col v-for="course in courses" :key="course.id" :xs="24" :sm="12" :md="8" :lg="6">
+      <el-col v-for="course in sortedCourses" :key="course.id" :xs="24" :sm="12" :md="8" :lg="6">
         <el-card class="course-card" shadow="hover" @click="router.push(`/courses/${course.id}`)">
-          <div class="course-name">{{ course.name }}</div>
+          <div class="course-heading">
+            <div class="course-name">{{ course.name }}</div>
+            <el-tooltip v-if="priorityOf(course.id)" placement="top" :show-after="300">
+              <template #content>
+                <div class="priority-tooltip">
+                  <div v-for="reason in priorityOf(course.id).reasons" :key="reason">· {{ reason }}</div>
+                </div>
+              </template>
+              <el-tag :type="priorityTagType(priorityOf(course.id).level)" size="small">
+                #{{ priorityOf(course.id).rank }} {{ priorityOf(course.id).level_label }}
+              </el-tag>
+            </el-tooltip>
+          </div>
           <div class="course-meta">
             <el-tag v-if="course.semester" size="small">{{ course.semester }}</el-tag>
             <span v-if="course.teacher" class="teacher">{{ course.teacher }}</span>
           </div>
           <div class="course-desc">{{ course.description || '暂无简介' }}</div>
+          <div v-if="priorityOf(course.id)" class="priority-panel">
+            <div class="priority-score-row">
+              <span>优先级 {{ priorityOf(course.id).score }} 分</span>
+              <span>学习进度 {{ priorityOf(course.id).progress }}%</span>
+            </div>
+            <el-progress
+              :percentage="priorityOf(course.id).progress"
+              :status="progressStatus(priorityOf(course.id).progress)"
+              :stroke-width="6"
+              :show-text="false"
+            />
+            <div class="priority-reason">{{ priorityOf(course.id).reasons[0] }}</div>
+          </div>
           <div class="course-actions" @click.stop>
             <el-button size="small" @click="router.push(`/courses/${course.id}/chat`)">
               <el-icon><ChatDotRound /></el-icon>问答
@@ -130,10 +200,45 @@ async function remove(course) {
   margin-bottom: 16px;
   cursor: pointer;
 }
+.priority-tip {
+  margin-bottom: 16px;
+}
+.course-heading {
+  display: flex;
+  min-height: 24px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
 .course-name {
   font-size: 16px;
   font-weight: 600;
   margin-bottom: 8px;
+}
+.priority-panel {
+  padding: 9px 10px;
+  margin-bottom: 12px;
+  border-radius: 7px;
+  background: #f7f9fc;
+}
+.priority-score-row {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 6px;
+  color: #606266;
+  font-size: 12px;
+}
+.priority-reason {
+  margin-top: 5px;
+  overflow: hidden;
+  color: #909399;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.priority-tooltip {
+  max-width: 260px;
+  line-height: 1.7;
 }
 .course-meta {
   display: flex;

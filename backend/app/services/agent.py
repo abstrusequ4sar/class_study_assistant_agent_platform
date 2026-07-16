@@ -72,6 +72,46 @@ PLAN_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+QUIZ_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "correct_index": {
+                        "type": "integer",
+                        "description": "正确选项下标，只能是 0、1、2、3",
+                    },
+                    "explanation": {"type": "string"},
+                    "topic": {"type": "string"},
+                    "source_index": {
+                        "type": "integer",
+                        "description": "题目依据的资料片段编号",
+                    },
+                },
+                "required": [
+                    "prompt",
+                    "options",
+                    "correct_index",
+                    "explanation",
+                    "topic",
+                    "source_index",
+                ],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["questions"],
+    "additionalProperties": False,
+}
+
 _OFFLINE_HINT = "在 backend/.env 中配置 LLM_API_KEY（支持 Anthropic / OpenAI 兼容接口）以启用智能功能。"
 
 
@@ -834,6 +874,163 @@ def summarize_knowledge(course_name: str, chunks: list[RetrievedChunk]) -> dict:
     if result is None:  # 防御性兜底，正常生成器必定产生 done
         raise RuntimeError("知识点整理未产生结果")
     return result
+
+
+# ---------------------------------------------------------------- 阶段性测验
+
+def _sample_quiz_chunks(
+    chunks: list[RetrievedChunk], question_count: int
+) -> list[RetrievedChunk]:
+    """在保持章节顺序的前提下均匀取样，避免测验只覆盖资料开头。"""
+    limit = min(len(chunks), max(question_count * 3, 12))
+    if len(chunks) <= limit:
+        return chunks
+    indices = [round(i * (len(chunks) - 1) / (limit - 1)) for i in range(limit)]
+    return [chunks[index] for index in indices]
+
+
+def _quiz_excerpt(content: str, limit: int = 100) -> str:
+    cleaned = re.sub(r"\s+", " ", content).strip()
+    return cleaned[:limit] + ("…" if len(cleaned) > limit else "")
+
+
+def _fallback_quiz_questions(
+    chunks: list[RetrievedChunk],
+    question_count: int,
+    stage: str,
+    focus: str,
+    start_id: int = 1,
+) -> list[dict]:
+    questions = []
+    distractors = [
+        "本阶段无需理解概念之间的联系，只需记住标题。",
+        "课程资料说明所有结论在任何条件下都完全相同。",
+        "该阶段没有需要复习、练习或验证的知识内容。",
+    ]
+    for offset in range(question_count):
+        chunk = chunks[offset % len(chunks)]
+        correct = _quiz_excerpt(chunk.content, 88)
+        correct_index = offset % 4
+        options = distractors.copy()
+        options.insert(correct_index, correct)
+        topic = focus.strip() or stage.strip() or f"资料理解 {start_id + offset}"
+        questions.append(
+            {
+                "id": start_id + offset,
+                "prompt": f"根据《{chunk.material_name}》，以下哪项与课程资料内容一致？",
+                "options": options,
+                "correct_index": correct_index,
+                "explanation": "正确选项来自本课程上传资料的对应片段，可点击来源回到原资料核对。",
+                "topic": topic[:64],
+                "source": {
+                    "material_id": chunk.material_id,
+                    "material_name": chunk.material_name,
+                    "excerpt": _quiz_excerpt(chunk.content, 140),
+                },
+            }
+        )
+    return questions
+
+
+def _normalize_quiz_questions(
+    raw_questions: list,
+    chunks: list[RetrievedChunk],
+    question_count: int,
+    stage: str,
+    focus: str,
+) -> list[dict]:
+    normalized = []
+    for raw in raw_questions:
+        if len(normalized) >= question_count or not isinstance(raw, dict):
+            break
+        options = raw.get("options")
+        try:
+            correct_index = int(raw.get("correct_index"))
+            source_index = int(raw.get("source_index"))
+        except (TypeError, ValueError):
+            continue
+        prompt = str(raw.get("prompt", "")).strip()
+        if (
+            not prompt
+            or not isinstance(options, list)
+            or len(options) != 4
+            or not 0 <= correct_index < 4
+            or not 1 <= source_index <= len(chunks)
+        ):
+            continue
+        clean_options = [str(option).strip() for option in options]
+        if any(not option for option in clean_options):
+            continue
+        chunk = chunks[source_index - 1]
+        normalized.append(
+            {
+                "id": len(normalized) + 1,
+                "prompt": prompt[:1000],
+                "options": [option[:500] for option in clean_options],
+                "correct_index": correct_index,
+                "explanation": str(raw.get("explanation", "")).strip()[:1000]
+                or "请回到对应资料片段复习该知识点。",
+                "topic": str(raw.get("topic", "")).strip()[:64]
+                or focus.strip()[:64]
+                or stage.strip()[:64],
+                "source": {
+                    "material_id": chunk.material_id,
+                    "material_name": chunk.material_name,
+                    "excerpt": _quiz_excerpt(chunk.content, 140),
+                },
+            }
+        )
+    if len(normalized) < question_count:
+        normalized.extend(
+            _fallback_quiz_questions(
+                chunks,
+                question_count - len(normalized),
+                stage,
+                focus,
+                start_id=len(normalized) + 1,
+            )
+        )
+    return normalized
+
+
+def generate_stage_quiz(
+    course_name: str,
+    stage: str,
+    focus: str,
+    chunks: list[RetrievedChunk],
+    question_count: int,
+) -> dict:
+    """从课程资料生成四选一测验；未配置模型时仍提供可核查的资料理解题。"""
+    sampled = _sample_quiz_chunks(chunks, question_count)
+    try:
+        system = (
+            f"你是《{course_name}》课程的命题教师。请只依据给出的课程资料片段，"
+            "生成有区分度的四选一阶段测验，覆盖不同知识点并兼顾概念理解与应用。"
+            "每题必须恰好有 4 个选项且只有一个正确答案；source_index 必须填写实际依据的片段编号。"
+            "不要把资料片段编号写进题干或选项。"
+        )
+        context = "\n\n".join(
+            f"[{index}]《{chunk.material_name}》\n{chunk.content[:900]}"
+            for index, chunk in enumerate(sampled, start=1)
+        )
+        user_content = (
+            f"学习阶段：{stage}\n"
+            f"重点范围：{focus or '综合覆盖本阶段资料'}\n"
+            f"题目数量：{question_count}\n\n"
+            f"课程资料片段：\n{context}"
+        )
+        content = complete_json(system, user_content, QUIZ_SCHEMA, max_tokens=6144)
+        questions = _normalize_quiz_questions(
+            content.get("questions", []), sampled, question_count, stage, focus
+        )
+        return {"questions": questions, "agent_mode": "llm"}
+    except LLMUnavailableError:
+        return {
+            "questions": _fallback_quiz_questions(
+                sampled, question_count, stage, focus
+            ),
+            "agent_mode": "fallback",
+        }
 
 
 # ---------------------------------------------------------------- 学习计划

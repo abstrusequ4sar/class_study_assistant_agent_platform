@@ -12,6 +12,7 @@ export const createCourse = (data) => client.post('/courses', data)
 export const getCourse = (id) => client.get(`/courses/${id}`)
 export const updateCourse = (id, data) => client.put(`/courses/${id}`, data)
 export const deleteCourse = (id) => client.delete(`/courses/${id}`)
+export const listCoursePriorities = () => client.get('/courses/priorities')
 export const knowledgeSummary = (id) =>
   client.post(`/courses/${id}/knowledge-summary`, null, { timeout: 600000 })
 
@@ -154,3 +155,14 @@ export const getTaskReminders = () => client.get('/tasks/reminders')
 export const createTask = (data) => client.post('/tasks', data)
 export const updateTask = (id, data) => client.put(`/tasks/${id}`, data)
 export const deleteTask = (id) => client.delete(`/tasks/${id}`)
+
+// ---- 阶段性测验与学习进度 ----
+export const listQuizzes = (courseId) => client.get(`/courses/${courseId}/quizzes`)
+export const generateQuiz = (courseId, data) =>
+  client.post(`/courses/${courseId}/quizzes`, data, { timeout: 180000 })
+export const getQuiz = (id) => client.get(`/quizzes/${id}`)
+export const submitQuiz = (id, answers) =>
+  client.post(`/quizzes/${id}/submit`, { answers })
+export const deleteQuiz = (id) => client.delete(`/quizzes/${id}`)
+export const getLearningProgress = (courseId) =>
+  client.get(`/courses/${courseId}/learning-progress`)

@@ -12,12 +12,14 @@
 | --- | --- |
 | 用户认证 | 注册 / 登录（JWT）、个人信息管理（昵称、密码） |
 | 课程管理 | 创建 / 编辑 / 删除课程，包含名称、简介、授课教师、学期 |
+| 动态优先级 | 综合临期任务、任务量、计划期限、完成率和阶段测验成绩实时评分，自动排列课程并解释优先原因 |
 | 资料管理 | 按课程拖拽或点击批量上传 / 查看 / 下载 / 删除资料（课件、教材笔记、作业要求、实验指导等），txt / md / pdf / docx / pptx 自动解析入库 |
 | 资料检索 | 按类型、文件名筛选资料；正文片段检索支持**向量语义检索**（配置 Embedding 后），未配置时自动退回关键词打分 |
 | Agent 对话 | 真正的**工具驱动 Agent**：模型持有检索资料 / 查看课程 / 管理任务等工具，自主决定调用哪个、调几轮、何时作答；SSE 流式输出、工具调用过程可视化、多轮对话 |
 | 学习计划 | 输入学习目标、截止时间、每日可用时间，生成阶段任务 + 每日待办 |
 | 待办任务 | 手动添加、计划生成或 **Agent 对话中直接创建**；完成勾选、逾期标红、状态筛选、**日历视图**、**到期提醒**（登录弹窗 + 提醒面板） |
 | 个人中心 | 课程 / 计划 / 任务 / 对话统计与快捷入口，资料与账号管理 |
+| 阶段性测验 | 根据课程资料生成 3–10 道阶段测验题，自动批改并记录成绩、薄弱知识点和综合学习进度 |
 
 ### 高级功能
 
@@ -25,6 +27,8 @@
 - **知识点整理**：读取课程全部可解析内容，按 Chap / Chapter / 第 N 章自然排序；最多 3 批并行总结并通过 SSE 实时显示进度，最终按原顺序生成完整 Markdown 提纲
 - **智能任务拆解**：输入「我要两周复习完高等数学期末考试」等目标，自动拆解为阶段任务和每日待办并落库为任务
 - **多课程学习规划**：根据多门课程的截止时间和任务量，生成综合每日学习安排
+- **课程动态优先级**：不保存容易过期的固定等级，而是在每次查看时用最新任务、计划和测验数据重算 0–100 分；课程卡片展示排名、进度和具体原因
+- **阶段性测验检测进度**：按学习阶段和检测重点从课程资料命题，答案仅保存在服务端；提交后提供逐题解析、资料来源跳转、成绩趋势和高频薄弱点，测验结果会反向影响课程优先级
 
 ### Agent 架构（工具循环）
 
@@ -137,7 +141,7 @@ npm run build
 │   │   ├── main.py              # FastAPI 入口（CORS、路由注册、建表）
 │   │   ├── config.py            # 环境配置
 │   │   ├── database.py          # SQLAlchemy 引擎与会话
-│   │   ├── models/              # ORM 模型（用户/课程/资料/对话/计划/任务）
+│   │   ├── models/              # ORM 模型（用户/课程/资料/对话/计划/任务/阶段测验）
 │   │   ├── schemas/             # Pydantic 请求响应模型（入参校验）
 │   │   ├── routers/             # REST API 路由
 │   │   │   ├── auth.py          #   认证与个人信息
@@ -145,12 +149,14 @@ npm run build
 │   │   │   ├── materials.py     #   资料上传/检索/下载/删除
 │   │   │   ├── chat.py          #   Agent 对话（带引用）
 │   │   │   ├── plans.py         #   学习计划（单课程/多课程）
-│   │   │   └── tasks.py         #   待办任务
+│   │   │   ├── tasks.py         #   待办任务
+│   │   │   └── assessments.py   #   阶段测验、批改与学习进度检测
 │   │   └── services/
 │   │       ├── llm.py           # 统一 LLM 客户端（双协议：文本/JSON/流式/Agent 工具循环）
 │   │       ├── agent.py         # Agent 工具集与执行器、知识点/计划生成、离线降级
 │   │       ├── embeddings.py    # 向量嵌入（OpenAI 兼容 /embeddings）
 │   │       ├── retrieval.py     # 向量语义检索 + 关键词兜底
+│   │       ├── priority.py      # 动态优先级评分与可解释指标
 │   │       ├── extraction.py    # 文本抽取与切片（txt/md/pdf/docx/pptx）
 │   │       └── security.py      # 密码哈希 / JWT
 │   ├── tests/                   # pytest 测试套件
@@ -178,6 +184,8 @@ npm run build
 | `messages` | 消息 | conversation_id、role、content、citations_json（引用） |
 | `study_plans` | 学习计划 | user_id、course_id、goal、deadline、content_json |
 | `tasks` | 待办任务 | user_id、course_id、plan_id、title、due_date、completed |
+| `stage_quizzes` | 阶段测验 | user_id、course_id、stage、focus、questions_json、agent_mode |
+| `quiz_attempts` | 测验作答记录 | quiz_id、score、answers_json、feedback_json、correct_count |
 
 ## API 概览
 
@@ -188,6 +196,7 @@ npm run build
 | POST | `/auth/register` `/auth/login` | 注册 / 登录 |
 | GET/PUT | `/auth/me` | 查看 / 修改个人信息 |
 | GET/POST | `/courses`，PUT/DELETE `/courses/{id}` | 课程 CRUD |
+| GET | `/courses/priorities` | 动态课程优先级排名、评分构成与原因 |
 | POST | `/courses/{id}/knowledge-summary` | 生成知识点提纲 ★ |
 | POST/GET | `/courses/{id}/materials` | 上传 / 列出资料 |
 | GET | `/courses/{id}/materials/search?q=` | 资料内容检索 |
@@ -199,6 +208,10 @@ npm run build
 | POST | `/plans` | 生成学习计划（自动拆解任务）★ |
 | POST | `/plans/multi-course` | 多课程综合规划 ★ |
 | GET/POST | `/tasks`，PUT/DELETE `/tasks/{id}` | 任务 CRUD |
+| GET/POST | `/courses/{id}/quizzes` | 查看 / 生成阶段性测验 ★ |
+| GET/DELETE | `/quizzes/{id}` | 查看 / 删除测验 |
+| POST | `/quizzes/{id}/submit` | 提交答案并自动批改 |
+| GET | `/courses/{id}/learning-progress` | 成绩趋势、薄弱点与综合学习进度 |
 
 ★ 为 Agent 相关接口，响应携带 `agent_mode`（`llm` / `fallback`）。
 
@@ -236,6 +249,8 @@ npm run build
 - [x] 任务提醒与日历视图
 - [x] 工具驱动的 Agent 循环（检索 / 建任务由模型自主决策）
 - [x] Agent 工具扩展（10 个工具：资料读取、课程创建、任务全生命周期、计划保存）
+- [x] 可解释的课程动态优先级（任务、计划、完成率、测验联动）
+- [x] 基于课程资料的阶段测验、自动批改与学习进度检测
 - [ ] Docker Compose 一键部署
 - [ ] 对话内工具调用需用户确认的权限机制（如删除任务前确认）
 - [ ] Agent 主动性：登录时根据临期任务主动提醒并给出建议

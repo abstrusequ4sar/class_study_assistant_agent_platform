@@ -15,13 +15,17 @@ from ..models import (
     Material,
     MaterialChunk,
     Message,
+    QuizAttempt,
+    StageQuiz,
     StudyPlan,
     Task,
     User,
 )
 from ..schemas.chat import KnowledgeSummaryOut
 from ..schemas.course import CourseCreate, CourseOut, CourseUpdate
+from ..schemas.assessment import CoursePriorityOut
 from ..services import agent
+from ..services.priority import calculate_course_priorities
 from ..services.retrieval import ordered_course_chunks
 from ..services.security import get_current_user
 
@@ -68,6 +72,14 @@ def list_courses(
     )
 
 
+@router.get("/priorities", response_model=list[CoursePriorityOut])
+def list_course_priorities(
+    current: User = Depends(get_current_user), db: Session = Depends(get_db)
+):
+    """根据任务、计划与最近测验结果实时计算课程学习优先级。"""
+    return calculate_course_priorities(db, current.id)
+
+
 @router.get("/{course_id}", response_model=CourseOut)
 def get_course(course: Course = Depends(get_owned_course)):
     return course
@@ -97,6 +109,16 @@ def delete_course(
     conv_ids = db.execute(
         select(Conversation.id).where(Conversation.course_id == course.id)
     ).scalars().all()
+    quiz_ids = db.execute(
+        select(StageQuiz.id).where(StageQuiz.course_id == course.id)
+    ).scalars().all()
+    if quiz_ids:
+        db.query(QuizAttempt).filter(QuizAttempt.quiz_id.in_(quiz_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(StageQuiz).filter(StageQuiz.id.in_(quiz_ids)).delete(
+            synchronize_session=False
+        )
     if conv_ids:
         db.query(Message).filter(Message.conversation_id.in_(conv_ids)).delete(
             synchronize_session=False

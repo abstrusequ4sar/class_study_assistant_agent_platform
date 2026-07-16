@@ -5,7 +5,7 @@ from sqlalchemy import text as sa_text
 
 from .config import settings
 from .database import Base, engine
-from .routers import auth, chat, courses, materials, plans, tasks
+from .routers import assessments, auth, chat, courses, materials, plans, tasks
 from .services import llm
 from . import models  # noqa: F401  确保所有模型注册到 Base.metadata
 
@@ -31,8 +31,8 @@ _ensure_schema()
 
 app = FastAPI(
     title="课程学习助手 Agent 平台",
-    description="课程/资料管理 + 基于课程资料的智能问答、知识点整理与学习计划生成",
-    version="0.1.0",
+    description="课程/资料管理 + 资料问答、知识点整理、动态优先级、阶段测验与学习计划",
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -49,6 +49,7 @@ app.include_router(materials.router)
 app.include_router(chat.router)
 app.include_router(plans.router)
 app.include_router(tasks.router)
+app.include_router(assessments.router)
 
 
 @app.get("/api/health")

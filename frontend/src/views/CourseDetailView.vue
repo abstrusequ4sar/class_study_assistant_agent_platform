@@ -4,11 +4,17 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   deleteMaterial,
+  deleteQuiz,
+  generateQuiz,
   getCourse,
+  getLearningProgress,
+  getQuiz,
   knowledgeSummaryStream,
   listMaterials,
+  listQuizzes,
   materialDownloadUrl,
   searchMaterialContent,
+  submitQuiz,
   uploadMaterial,
 } from '../api'
 import { renderMarkdown } from '../utils/markdown'
@@ -18,6 +24,7 @@ const router = useRouter()
 const courseId = Number(route.params.id)
 
 const course = ref(null)
+const activeTab = ref('materials')
 const materials = ref([])
 const filter = reactive({ mtype: '', keyword: '' })
 const uploadForm = reactive({ mtype: 'courseware', description: '' })
@@ -34,6 +41,14 @@ const summarizing = ref(false)
 const summaryElapsed = ref(0)
 const summaryProgress = reactive({ completed: 0, total: 0, materials: 0, fragments: 0 })
 let summaryTimer = null
+const quizzes = ref([])
+const learningProgress = ref(null)
+const quizForm = reactive({ stage: '当前学习阶段', focus: '', question_count: 5 })
+const generatingQuiz = ref(false)
+const activeQuiz = ref(null)
+const quizAnswers = ref([])
+const quizResult = ref(null)
+const submittingQuiz = ref(false)
 const sourceMaterialId = computed(() => Number(route.query.material_id) || null)
 const sourceCitationIndex = computed(() => route.query.citation || '')
 const sourceMaterial = computed(() =>
@@ -72,6 +87,14 @@ const uploadButtonText = computed(() => {
   }
   return `正在上传 ${uploadingIndex.value + 1}/${uploadFiles.value.length}`
 })
+const answeredCount = computed(() =>
+  quizAnswers.value.filter((answer) => Number.isInteger(answer)).length,
+)
+const resultByQuestion = computed(() =>
+  Object.fromEntries(
+    (quizResult.value?.results || []).map((item) => [item.question_id, item]),
+  ),
+)
 
 function formatFileSize(bytes) {
   if (bytes < 1024) return `${bytes} B`
@@ -87,10 +110,19 @@ async function refreshMaterials() {
   materials.value = data
 }
 
+async function refreshQuizData() {
+  const [{ data: quizData }, { data: progressData }] = await Promise.all([
+    listQuizzes(courseId),
+    getLearningProgress(courseId),
+  ])
+  quizzes.value = quizData
+  learningProgress.value = progressData
+}
+
 onMounted(async () => {
   const { data } = await getCourse(courseId)
   course.value = data
-  await refreshMaterials()
+  await Promise.all([refreshMaterials(), refreshQuizData()])
   if (sourceMaterialId.value) {
     await nextTick()
     document.querySelector('.source-material-row')?.scrollIntoView({
@@ -99,6 +131,78 @@ onMounted(async () => {
     })
   }
 })
+
+async function createStageQuiz() {
+  generatingQuiz.value = true
+  try {
+    const { data } = await generateQuiz(courseId, quizForm)
+    quizzes.value.unshift(data)
+    openQuiz(data)
+    ElMessage.success('阶段测验已生成，请完成全部题目后提交')
+  } finally {
+    generatingQuiz.value = false
+  }
+}
+
+async function openQuiz(quiz) {
+  const { data } = quiz.questions?.length ? { data: quiz } : await getQuiz(quiz.id)
+  activeQuiz.value = data
+  quizAnswers.value = Array(data.question_count).fill(null)
+  quizResult.value = null
+}
+
+function closeQuiz() {
+  activeQuiz.value = null
+  quizAnswers.value = []
+  quizResult.value = null
+}
+
+async function submitActiveQuiz() {
+  if (answeredCount.value !== activeQuiz.value.question_count) {
+    ElMessage.warning('请完成全部题目后再提交')
+    return
+  }
+  submittingQuiz.value = true
+  try {
+    const { data } = await submitQuiz(activeQuiz.value.id, quizAnswers.value)
+    quizResult.value = data
+    ElMessage.success(`测验完成：${data.score} 分`)
+    await refreshQuizData()
+  } finally {
+    submittingQuiz.value = false
+  }
+}
+
+async function removeQuiz(quiz) {
+  await ElMessageBox.confirm(`确定删除「${quiz.title}」及其答题记录？`, '删除确认', {
+    type: 'warning',
+  })
+  await deleteQuiz(quiz.id)
+  if (activeQuiz.value?.id === quiz.id) closeQuiz()
+  await refreshQuizData()
+  ElMessage.success('测验记录已删除')
+}
+
+async function jumpToQuizSource(source, questionId) {
+  activeTab.value = 'materials'
+  await router.replace({
+    path: `/courses/${courseId}`,
+    query: { material_id: source.material_id, citation: `测验题 ${questionId}` },
+  })
+  await nextTick()
+  document.querySelector('.source-material-row')?.scrollIntoView({
+    behavior: 'smooth',
+    block: 'center',
+  })
+}
+
+function scoreText(value) {
+  return value === null || value === undefined ? '--' : `${value}`
+}
+
+function formatDateTime(value) {
+  return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '--'
+}
 
 function materialRowClassName({ row }) {
   return row.id === sourceMaterialId.value ? 'source-material-row' : ''
@@ -265,8 +369,8 @@ function download(m) {
       </template>
     </el-page-header>
 
-    <el-tabs class="tabs">
-      <el-tab-pane label="资料管理">
+    <el-tabs v-model="activeTab" class="tabs">
+      <el-tab-pane label="资料管理" name="materials">
         <el-card class="block">
           <template #header>上传资料</template>
           <div class="upload-panel">
@@ -387,7 +491,7 @@ function download(m) {
         </el-card>
       </el-tab-pane>
 
-      <el-tab-pane label="知识点整理">
+      <el-tab-pane label="知识点整理" name="summary">
         <el-card class="block">
           <template #header>
             <div class="filter-row">
@@ -434,6 +538,205 @@ function download(m) {
           />
           <div v-if="summary" class="markdown" v-html="summaryHtml" />
           <el-empty v-else-if="!summarizing" description="点击右上角按钮生成知识点提纲" />
+        </el-card>
+      </el-tab-pane>
+
+      <el-tab-pane label="阶段测验" name="quiz">
+        <template v-if="learningProgress">
+          <el-row :gutter="12" class="progress-cards">
+            <el-col :xs="12" :sm="6">
+              <el-card shadow="never" class="progress-card">
+                <div class="progress-value">{{ scoreText(learningProgress.latest_score) }}</div>
+                <div class="progress-label">最近成绩</div>
+              </el-card>
+            </el-col>
+            <el-col :xs="12" :sm="6">
+              <el-card shadow="never" class="progress-card">
+                <div class="progress-value">{{ scoreText(learningProgress.best_score) }}</div>
+                <div class="progress-label">历史最好</div>
+              </el-card>
+            </el-col>
+            <el-col :xs="12" :sm="6">
+              <el-card shadow="never" class="progress-card">
+                <div class="progress-value">{{ learningProgress.combined_progress }}%</div>
+                <div class="progress-label">综合学习进度</div>
+              </el-card>
+            </el-col>
+            <el-col :xs="12" :sm="6">
+              <el-card shadow="never" class="progress-card">
+                <div class="progress-value mastery">{{ learningProgress.mastery_level }}</div>
+                <div class="progress-label">掌握状态 · {{ learningProgress.attempts }} 次作答</div>
+              </el-card>
+            </el-col>
+          </el-row>
+          <el-alert
+            v-if="learningProgress.weak_topics.length"
+            class="block"
+            type="warning"
+            :closable="false"
+            show-icon
+            :title="`建议优先巩固：${learningProgress.weak_topics.join('、')}`"
+            description="薄弱点根据最近 10 次测验中的错题频次动态更新，并参与课程优先级计算。"
+          />
+        </template>
+
+        <el-card v-if="!activeQuiz" class="block">
+          <template #header>
+            <div class="filter-row">
+              <span>生成阶段性测验</span>
+              <el-tag type="success" effect="plain">题目基于本课程资料</el-tag>
+            </div>
+          </template>
+          <el-form label-width="90px" class="quiz-create-form">
+            <el-form-item label="学习阶段" required>
+              <el-input
+                v-model="quizForm.stage"
+                maxlength="128"
+                placeholder="如：第一阶段、期中复习、第三至五章"
+              />
+            </el-form-item>
+            <el-form-item label="检测重点">
+              <el-input
+                v-model="quizForm.focus"
+                maxlength="256"
+                placeholder="如：栈与队列、微分中值定理（不填则综合覆盖）"
+              />
+            </el-form-item>
+            <el-form-item label="题目数量">
+              <el-slider v-model="quizForm.question_count" :min="3" :max="10" show-input />
+            </el-form-item>
+            <el-form-item>
+              <el-button
+                type="primary"
+                :loading="generatingQuiz"
+                :disabled="!quizForm.stage.trim()"
+                @click="createStageQuiz"
+              >
+                {{ generatingQuiz ? '正在读取资料并命题…' : '生成测验' }}
+              </el-button>
+              <span class="quiz-form-tip">自动覆盖不同知识点，提交后给出逐题解析和资料来源</span>
+            </el-form-item>
+          </el-form>
+        </el-card>
+
+        <el-card v-if="activeQuiz" class="block quiz-paper">
+          <template #header>
+            <div class="filter-row">
+              <div>
+                <strong>{{ activeQuiz.title }}</strong>
+                <el-tag v-if="activeQuiz.agent_mode === 'fallback'" class="ml" type="warning" size="small">
+                  离线资料理解题
+                </el-tag>
+              </div>
+              <el-button @click="closeQuiz">返回测验记录</el-button>
+            </div>
+          </template>
+          <el-alert
+            v-if="activeQuiz.agent_mode === 'fallback'"
+            class="block"
+            type="info"
+            :closable="false"
+            title="当前未配置大模型，系统已根据资料原文生成可核查的理解题；配置 LLM 后可生成概念与应用型题目。"
+          />
+          <div
+            v-for="(question, questionIndex) in activeQuiz.questions"
+            :key="question.id"
+            class="quiz-question"
+            :class="{
+              correct: resultByQuestion[question.id]?.correct,
+              wrong: quizResult && !resultByQuestion[question.id]?.correct,
+            }"
+          >
+            <div class="question-title">
+              <span>{{ questionIndex + 1 }}. {{ question.prompt }}</span>
+              <el-tag size="small" effect="plain">{{ question.topic }}</el-tag>
+            </div>
+            <el-radio-group v-model="quizAnswers[questionIndex]" class="quiz-options" :disabled="!!quizResult">
+              <el-radio
+                v-for="(option, optionIndex) in question.options"
+                :key="optionIndex"
+                :label="optionIndex"
+                border
+              >
+                {{ String.fromCharCode(65 + optionIndex) }}. {{ option }}
+              </el-radio>
+            </el-radio-group>
+            <div v-if="resultByQuestion[question.id]" class="question-feedback">
+              <div>
+                <el-tag :type="resultByQuestion[question.id].correct ? 'success' : 'danger'" size="small">
+                  {{ resultByQuestion[question.id].correct ? '回答正确' : '回答错误' }}
+                </el-tag>
+                <span v-if="!resultByQuestion[question.id].correct" class="correct-answer">
+                  正确答案：{{ String.fromCharCode(65 + resultByQuestion[question.id].correct_index) }}
+                </span>
+              </div>
+              <div class="explanation">{{ resultByQuestion[question.id].explanation }}</div>
+              <div v-if="resultByQuestion[question.id].source?.material_id" class="quiz-source">
+                <span>来源：《{{ resultByQuestion[question.id].source.material_name }}》</span>
+                <el-button
+                  link
+                  type="primary"
+                  @click="jumpToQuizSource(resultByQuestion[question.id].source, question.id)"
+                >
+                  查看原资料
+                </el-button>
+                <span class="source-excerpt">{{ resultByQuestion[question.id].source.excerpt }}</span>
+              </div>
+            </div>
+          </div>
+          <div class="quiz-submit-bar">
+            <div v-if="quizResult" class="quiz-score">
+              本次得分 <strong>{{ quizResult.score }}</strong> 分，答对
+              {{ quizResult.correct_count }}/{{ quizResult.total_count }} 题
+            </div>
+            <span v-else>已完成 {{ answeredCount }}/{{ activeQuiz.question_count }} 题</span>
+            <el-button
+              v-if="!quizResult"
+              type="primary"
+              :loading="submittingQuiz"
+              @click="submitActiveQuiz"
+            >
+              提交并检测学习进度
+            </el-button>
+            <el-button v-else type="primary" plain @click="openQuiz(activeQuiz)">再测一次</el-button>
+          </div>
+        </el-card>
+
+        <el-card v-if="!activeQuiz" class="block">
+          <template #header>测验记录与成绩趋势</template>
+          <el-table :data="quizzes" empty-text="还没有测验，先生成一份阶段测验吧">
+            <el-table-column prop="title" label="测验" min-width="160" />
+            <el-table-column prop="focus" label="检测重点" min-width="150">
+              <template #default="{ row }">{{ row.focus || '综合检测' }}</template>
+            </el-table-column>
+            <el-table-column prop="question_count" label="题数" width="70" />
+            <el-table-column label="最近成绩" width="100">
+              <template #default="{ row }">
+                <el-tag v-if="row.latest_attempt" :type="row.latest_attempt.score >= 60 ? 'success' : 'danger'">
+                  {{ row.latest_attempt.score }} 分
+                </el-tag>
+                <span v-else>未作答</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="生成时间" min-width="160">
+              <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="150" fixed="right">
+              <template #default="{ row }">
+                <el-button link type="primary" @click="openQuiz(row)">
+                  {{ row.latest_attempt ? '重新测验' : '开始作答' }}
+                </el-button>
+                <el-button link type="danger" @click="removeQuiz(row)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <div v-if="learningProgress?.trend.length" class="score-trend">
+            <span class="trend-title">最近成绩：</span>
+            <div v-for="(attempt, index) in learningProgress.trend" :key="attempt.id" class="trend-item">
+              <span>第 {{ index + 1 }} 次</span>
+              <strong :class="attempt.score >= 60 ? 'score-pass' : 'score-low'">{{ attempt.score }}</strong>
+            </div>
+          </div>
         </el-card>
       </el-tab-pane>
     </el-tabs>
@@ -580,5 +883,180 @@ function download(m) {
 .markdown :deep(li) {
   line-height: 1.7;
   font-size: 14px;
+}
+.progress-cards {
+  margin-bottom: 16px;
+}
+.progress-card {
+  margin-bottom: 12px;
+  text-align: center;
+}
+.progress-value {
+  min-height: 34px;
+  color: #1f4e79;
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 34px;
+}
+.progress-value.mastery {
+  font-size: 18px;
+}
+.progress-label {
+  margin-top: 3px;
+  color: #909399;
+  font-size: 12px;
+}
+.quiz-create-form {
+  max-width: 720px;
+}
+.quiz-form-tip {
+  margin-left: 12px;
+  color: #909399;
+  font-size: 12px;
+}
+.quiz-paper {
+  max-width: 1000px;
+  margin-right: auto;
+  margin-left: auto;
+}
+.quiz-question {
+  padding: 18px;
+  margin-bottom: 14px;
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+.quiz-question.correct {
+  border-color: #95d475;
+  background: #f0f9eb;
+}
+.quiz-question.wrong {
+  border-color: #fab6b6;
+  background: #fef0f0;
+}
+.question-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  color: #303133;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.7;
+}
+.quiz-options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  width: 100%;
+}
+.quiz-options :deep(.el-radio) {
+  box-sizing: border-box;
+  width: 100%;
+  height: auto;
+  min-height: 40px;
+  margin: 0;
+  padding: 9px 12px;
+  white-space: normal;
+}
+.quiz-options :deep(.el-radio__label) {
+  line-height: 1.5;
+  white-space: normal;
+}
+.question-feedback {
+  padding-top: 12px;
+  margin-top: 14px;
+  border-top: 1px dashed #dcdfe6;
+}
+.correct-answer {
+  margin-left: 10px;
+  color: #f56c6c;
+  font-size: 13px;
+  font-weight: 600;
+}
+.explanation {
+  margin-top: 8px;
+  color: #606266;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.quiz-source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  color: #606266;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.source-excerpt {
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 5px;
+  background: rgb(255 255 255 / 70%);
+  color: #909399;
+  line-height: 1.6;
+}
+.quiz-submit-bar {
+  position: sticky;
+  bottom: -20px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-top: 1px solid #dcdfe6;
+  background: rgb(255 255 255 / 96%);
+  box-shadow: 0 -4px 12px rgb(0 0 0 / 5%);
+}
+.quiz-score strong {
+  color: #409eff;
+  font-size: 24px;
+}
+.score-trend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 4px 2px;
+  overflow-x: auto;
+}
+.trend-title {
+  color: #606266;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.trend-item {
+  display: flex;
+  min-width: 62px;
+  flex-direction: column;
+  align-items: center;
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: #f5f7fa;
+  color: #909399;
+  font-size: 11px;
+}
+.trend-item strong {
+  margin-top: 3px;
+  font-size: 16px;
+}
+.score-pass {
+  color: #67c23a;
+}
+.score-low {
+  color: #f56c6c;
+}
+@media (max-width: 700px) {
+  .quiz-options {
+    grid-template-columns: 1fr;
+  }
+  .quiz-form-tip {
+    display: block;
+    margin: 8px 0 0;
+  }
+  .quiz-submit-bar {
+    bottom: -20px;
+  }
 }
 </style>

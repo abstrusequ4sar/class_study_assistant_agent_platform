@@ -5,6 +5,7 @@ from .material import Material, MaterialChunk
 from .conversation import Conversation, Message
 from .study_plan import StudyPlan
 from .task import Task
+from .assessment import QuizAttempt, StageQuiz
 
 __all__ = [
     "User",
@@ -15,4 +16,6 @@ __all__ = [
     "Message",
     "StudyPlan",
     "Task",
+    "StageQuiz",
+    "QuizAttempt",
 ]
